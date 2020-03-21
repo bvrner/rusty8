@@ -1,7 +1,8 @@
 use std::io;
 use std::io::Read;
-
 use std::ptr;
+
+use rand::Rng;
 
 pub const FONTSET: [u8; 80] = [
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -22,6 +23,8 @@ pub const FONTSET: [u8; 80] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
+// this probably results in a stack overflow on some systems
+// TODO use the heap instead
 pub struct CPU {
     opcode: u16,         // current opcode
     registers: [u8; 16], // 8 bit registers
@@ -32,6 +35,10 @@ pub struct CPU {
     sp: u16, // stack pointer
     pub memory: [u8; 4096],
     pc: u16, // program counter
+    gfx: [u8; 64 * 32],
+    draw_flag: bool,
+    keyboard: [bool; 0xF],
+    rng: rand::prelude::ThreadRng,
 }
 
 impl CPU {
@@ -51,6 +58,10 @@ impl CPU {
             sp: 0,
             memory: mem,
             pc: 0x200,
+            gfx: [0; 64 * 32],
+            draw_flag: false,
+            keyboard: [false; 0xF],
+            rng: rand::thread_rng(),
         }
     }
 
@@ -181,8 +192,8 @@ impl CPU {
 
                     // plus equal
                     0x0004 => {
-                        let regx = (self.opcode & 0x0F00 >> 8) as usize;
-                        let regy = (self.opcode & 0x00F0 >> 4) as usize;
+                        let regx = ((self.opcode & 0x0F00) >> 8) as usize;
+                        let regy = ((self.opcode & 0x00F0) >> 4) as usize;
 
                         let (res, overflow) =
                             self.registers[regx].overflowing_add(self.registers[regy]);
@@ -195,8 +206,8 @@ impl CPU {
 
                     // minus equal
                     0x0005 => {
-                        let regx = (self.opcode & 0x0F00 >> 8) as usize;
-                        let regy = (self.opcode & 0x00F0 >> 4) as usize;
+                        let regx = ((self.opcode & 0x0F00) >> 8) as usize;
+                        let regy = ((self.opcode & 0x00F0) >> 4) as usize;
 
                         let (res, overflow) =
                             self.registers[regx].overflowing_sub(self.registers[regy]);
@@ -217,8 +228,8 @@ impl CPU {
 
                     // minus assign, but the terms are reversed
                     0x0007 => {
-                        let regx = (self.opcode & 0x0F00 >> 8) as usize;
-                        let regy = (self.opcode & 0x00F0 >> 4) as usize;
+                        let regx = ((self.opcode & 0x0F00) >> 8) as usize;
+                        let regy = ((self.opcode & 0x00F0) >> 4) as usize;
 
                         let (res, overflow) =
                             self.registers[regy].overflowing_sub(self.registers[regx]);
@@ -265,10 +276,37 @@ impl CPU {
             }
 
             // rand
-            0xC000 => todo!(),
+            0xC000 => {
+                self.registers[((self.opcode & 0x0F00) >> 8) as usize] =
+                    self.rng.gen::<u8>() & (self.opcode & 0x00FF) as u8;
+            }
 
             // draw
-            0xD000 => todo!(),
+            // the ugliest instruction here
+            // TODO refactor this
+            0xD000 => {
+                let x = self.registers[((self.opcode & 0x0F00) >> 8) as usize];
+                let y = self.registers[((self.opcode & 0x00F0) >> 4) as usize];
+                let height = self.opcode & 0x000F;
+                let mut pixel;
+
+                self.registers[0xF] = 0;
+                for yline in 0..height {
+                    pixel = self.memory[(self.i + yline) as usize];
+                    for xline in 0..8 {
+                        if (pixel & (0x80 >> xline)) != 0
+                            && self.gfx[((x + xline) as u16 + ((y as u16 + yline) * 64)) as usize]
+                                == 1
+                        {
+                            self.registers[0xF] = 1;
+                            self.gfx[((x + xline) as u16 + ((y as u16 + yline) * 64)) as usize] ^=
+                                1;
+                        }
+                    }
+                }
+                self.draw_flag = true;
+                self.pc += 2;
+            }
 
             // keyboard
             0xE000 => todo!(),
