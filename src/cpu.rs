@@ -23,8 +23,6 @@ pub const FONTSET: [u8; 80] = [
     0xF0, 0x80, 0xF0, 0x80, 0x80, // F
 ];
 
-// this probably results in a stack overflow on some systems
-// TODO use the heap instead
 pub struct CPU {
     opcode: u16,         // current opcode
     registers: [u8; 16], // 8 bit registers
@@ -33,17 +31,17 @@ pub struct CPU {
     delay_timer: u8,
     stack: [u16; 16],
     sp: u16, // stack pointer
-    pub memory: [u8; 4096],
+    pub memory: Vec<u8>,
     pc: u16, // program counter
-    gfx: [u8; 64 * 32],
-    draw_flag: bool,
-    keyboard: [bool; 0xF],
+    pub gfx: [u8; 64 * 32],
+    pub draw_flag: bool,
+    pub keyboard: [bool; 16],
     rng: rand::prelude::ThreadRng,
 }
 
 impl CPU {
     pub fn init() -> Self {
-        let mut mem: [u8; 4096] = [0; 4096];
+        let mut mem: Vec<u8> = vec![0; 4096];
 
         // yes
         unsafe { ptr::copy_nonoverlapping(FONTSET.as_ptr(), mem.as_mut_ptr(), FONTSET.len()) };
@@ -60,13 +58,9 @@ impl CPU {
             pc: 0x200,
             gfx: [0; 64 * 32],
             draw_flag: false,
-            keyboard: [false; 0xF],
+            keyboard: [false; 16],
             rng: rand::thread_rng(),
         }
-    }
-
-    fn clear_screen(&self) {
-        todo!()
     }
 
     #[inline]
@@ -83,14 +77,20 @@ impl CPU {
 
     #[inline(always)]
     fn fetch(&mut self) {
-        self.opcode =
-            (self.memory[self.pc as usize] << 8 | self.memory[(self.pc + 1) as usize]).into();
+        self.opcode = ((self.memory[self.pc as usize] as u16) << 8)
+            | self.memory[(self.pc + 1) as usize] as u16;
+
+        // eprintln!("Fetched instruction: {:#x}", self.opcode);
     }
 
     pub fn decode(&mut self) {
         match self.opcode & 0xF000 {
             0x0000 => match self.opcode & 0x00FF {
-                0x00E0 => self.clear_screen(),
+                0x00E0 => {
+                    self.gfx.iter_mut().for_each(|x| *x = 0);
+                    self.draw_flag = true;
+                    self.pc += 2;
+                }
                 //return from subroutine
                 0x00EE => {
                     self.sp -= 1;
@@ -248,7 +248,7 @@ impl CPU {
                         self.pc += 2;
                     }
 
-                    _ => panic!("Unkown instruction {:#x}", self.opcode),
+                    _ => panic!("Unknown instruction {:#x}", self.opcode),
                 }
             }
 
@@ -272,35 +272,36 @@ impl CPU {
             // jump to
             0xB000 => {
                 self.pc = self.registers[0] as u16 + (self.opcode & 0x0FFF);
-                self.pc += 2;
             }
 
             // rand
             0xC000 => {
                 self.registers[((self.opcode & 0x0F00) >> 8) as usize] =
                     self.rng.gen::<u8>() & (self.opcode & 0x00FF) as u8;
+                self.pc += 2;
             }
 
             // draw
             // the ugliest instruction here
             // TODO refactor this
             0xD000 => {
-                let x = self.registers[((self.opcode & 0x0F00) >> 8) as usize];
-                let y = self.registers[((self.opcode & 0x00F0) >> 4) as usize];
-                let height = self.opcode & 0x000F;
+                let x = self.registers[((self.opcode & 0x0F00) >> 8) as usize] as usize;
+                let y = self.registers[((self.opcode & 0x00F0) >> 4) as usize] as usize;
+                let height = (self.opcode & 0x000F) as usize;
                 let mut pixel;
 
                 self.registers[0xF] = 0;
                 for yline in 0..height {
-                    pixel = self.memory[(self.i + yline) as usize];
+                    pixel = self.memory[(self.i as usize + yline)];
                     for xline in 0..8 {
-                        if (pixel & (0x80 >> xline)) != 0
-                            && self.gfx[((x + xline) as u16 + ((y as u16 + yline) * 64)) as usize]
-                                == 1
-                        {
-                            self.registers[0xF] = 1;
-                            self.gfx[((x + xline) as u16 + ((y as u16 + yline) * 64)) as usize] ^=
-                                1;
+                        if (pixel & (0x80 >> xline)) != 0 {
+                            // if the pixel go out of the screen
+                            let gfx_index = 2047_usize.min(x + xline + ((y + yline) * 64));
+
+                            if self.gfx[gfx_index] == 1 {
+                                self.registers[0xF] = 1;
+                            }
+                            self.gfx[gfx_index] ^= 1;
                         }
                     }
                 }
@@ -309,7 +310,28 @@ impl CPU {
             }
 
             // keyboard
-            0xE000 => todo!(),
+            0xE000 => match self.opcode & 0x000F {
+                0x000E => {
+                    let index = self.registers[((self.opcode & 0x0F00) >> 8) as usize] as usize;
+
+                    if self.keyboard[index] {
+                        self.pc += 4;
+                    } else {
+                        self.pc += 2;
+                    }
+                }
+
+                0x0001 => {
+                    let index = self.registers[((self.opcode & 0x0F00) >> 8) as usize] as usize;
+
+                    if !self.keyboard[index] {
+                        self.pc += 4;
+                    } else {
+                        self.pc += 2;
+                    }
+                }
+                _ => panic!("Unknown instruction: {:#x}", self.opcode),
+            },
 
             0xF000 => {
                 match self.opcode & 0x00FF {
@@ -320,7 +342,21 @@ impl CPU {
                     }
 
                     // get key
-                    0x000A => todo!(),
+                    0x000A => {
+                        let mut pressed = false;
+                        for (i, key) in self.keyboard.iter().enumerate() {
+                            if *key {
+                                self.registers[((self.opcode & 0x0F00) >> 8) as usize] = i as u8;
+                                pressed = true;
+                            }
+                        }
+
+                        if !pressed {
+                            return;
+                        }
+
+                        self.pc += 2;
+                    }
 
                     // set delay timer
                     0x0015 => {
@@ -334,11 +370,14 @@ impl CPU {
                         self.pc += 2;
                     }
 
-                    // add assing to address register
+                    // add assign to address register
                     0x001E => {
                         let res = self.i.wrapping_add(
                             self.registers[((self.opcode & 0x0F00) >> 8) as usize] as u16,
                         );
+
+                        self.registers[0xF] = if res > 0xFFF { 1 } else { 0 };
+
                         self.i = res;
                         self.pc += 2;
                     }
@@ -350,7 +389,7 @@ impl CPU {
                         self.pc += 2;
                     }
 
-                    // store the binaryy coded decimal somewhere in memory
+                    // store the binary coded decimal somewhere in memory
                     0x0033 => {
                         let reg_val = self.registers[((self.opcode & 0x0F00) >> 8) as usize];
                         let address = self.i as usize;
@@ -407,6 +446,13 @@ impl CPU {
                 }
             }
             _ => panic!("Unknown instruction: {:#x}", self.opcode),
+        }
+
+        if self.delay_timer > 0 {
+            self.delay_timer -= 1;
+        }
+        if self.sound_timer > 0 {
+            self.sound_timer -= 1;
         }
     }
 }
