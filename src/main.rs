@@ -1,4 +1,4 @@
-use chip8::cpu::CPU;
+use rusty8::cpu::CPU;
 
 use std::env;
 use std::fs::File;
